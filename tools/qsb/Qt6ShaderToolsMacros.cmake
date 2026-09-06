@@ -9,9 +9,10 @@
 # Configuring qsb:
 #     Specify OUTPUTS as a list with a matching element for each entry in FILES to override the resulting .qsb name.
 #         This makes sense when the desired name is different from the .vert/.frag source file name. (e.g. when DEFINES are involved)
-#     Specify GLSL, HLSL, MSL to override the versions to generate.
+#     Specify GLSL, HLSL, MSL, WGSL to override the versions to generate.
 #         Note: follows qsb and GLSL-style version syntax, e.g. "300 es,330".
-#     Specify NOGLSL, NOHLSL, or NOMSL to skip generating a given language.
+#         For WGSL, use version 100 for WGSL 1.0.
+#     Specify NOGLSL, NOHLSL, NOMSL, or NOWGSL to skip generating a given language.
 #         SPIR-V is always generated.
 #     Specify PRECOMPILE to trigger invoking native tools where applicable.
 #         F.ex. with HLSL enabled it passes -c to qsb which in turn runs fxc to store DXBC instead of HLSL.
@@ -76,8 +77,8 @@
 function(_qt_internal_add_shaders_impl target resourcename)
     cmake_parse_arguments(
         arg
-        "BATCHABLE;PRECOMPILE;PERTARGETCOMPILE;NOGLSL;NOHLSL;NOMSL;DEBUGINFO;OPTIMIZED;SILENT;QUIET;TESSELLATION;MULTIVIEW;MSLARGUMENTBUFFERS;MEDIUMP;_QT_INTERNAL"
-        "PREFIX;BASE;GLSL;HLSL;MSL;OUTPUT_TARGETS;TESSELLATION_VERTEX_COUNT;TESSELLATION_MODE;ZORDER_LOC;VIEW_COUNT"
+        "BATCHABLE;PRECOMPILE;PERTARGETCOMPILE;NOGLSL;NOHLSL;NOMSL;NOWGSL;DEBUGINFO;OPTIMIZED;SILENT;QUIET;TESSELLATION;MULTIVIEW;MSLARGUMENTBUFFERS;MEDIUMP;_QT_INTERNAL"
+        "PREFIX;BASE;GLSL;HLSL;MSL;WGSL;OUTPUT_TARGETS;TESSELLATION_VERTEX_COUNT;TESSELLATION_MODE;ZORDER_LOC;VIEW_COUNT"
         "FILES;ORIGINAL_FILES;OUTPUTS;DEFINES"
         ${ARGN}
     )
@@ -196,6 +197,15 @@ function(_qt_internal_add_shaders_impl target resourcename)
             endif()
             list(APPEND qsb_args "--msl")
             list(APPEND qsb_args "${metal_lang_versions}")
+        endif()
+
+        # WGSL is opt-in: a shader set gets it by asking for WGSL <version>.
+        # Tint cannot read the SPIR-V glslang emits for some shaders, so
+        # generating WGSL everywhere would break modules that have nothing to
+        # do with WebGPU.
+        if (NOT arg_NOWGSL AND arg_WGSL)
+            list(APPEND qsb_args "--wgsl")
+            list(APPEND qsb_args "${arg_WGSL}")
         endif()
 
         if (arg_VIEW_COUNT)

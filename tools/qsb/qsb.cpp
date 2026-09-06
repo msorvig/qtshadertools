@@ -592,6 +592,10 @@ int main(int argc, char **argv)
                                  QObject::tr("Comma separated list of Metal Shading Language versions to generate. F.ex. 12 is 1.2, 20 is 2.0."),
                                  QObject::tr("versions"));
     cmdLineParser.addOption(mslOption);
+    QCommandLineOption wgslOption("wgsl",
+                                 QObject::tr("Comma separated list of WGSL versions to generate. F.ex. 100 for version 1.0."),
+                                 QObject::tr("versions"));
+    cmdLineParser.addOption(wgslOption);
     QCommandLineOption shortcutDefaultOption("qt6", QObject::tr("Equivalent to --glsl \"100 es,120,150\" --hlsl 50 --msl 12. "
                                                                 "This set is commonly used with shaders for Qt Quick materials and effects."));
     cmdLineParser.addOption(shortcutDefaultOption);
@@ -872,6 +876,18 @@ int main(int argc, char **argv)
                     genShaders << std::make_pair(QShader::MslShader, QShaderVersion(v));
                 else
                     printError("Ignoring invalid MSL version %s", qPrintable(version));
+            }
+        }
+
+        if (cmdLineParser.isSet(wgslOption)) {
+            const QStringList versions = cmdLineParser.value(wgslOption).trimmed().split(',');
+            for (QString version : versions) {
+                bool ok = false;
+                int v = version.toInt(&ok);
+                if (ok)
+                    genShaders << std::make_pair(QShader::WgslShader, QShaderVersion(v));
+                else
+                    printError("Ignoring invalid WGSL version %s", qPrintable(version));
             }
         }
 

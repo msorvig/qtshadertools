@@ -1,0 +1,12 @@
+[submodule "src/3rdparty/tint"]
+	path = src/3rdparty/tint
+	url = https://dawn.googlesource.com/tint
+[submodule "src/3rdparty/abseil"]
+	path = src/3rdparty/abseil
+	url = https://github.com/abseil/abseil-cpp.git
+[submodule "src/3rdparty/spirv-headers"]
+	path = src/3rdparty/spirv-headers
+	url = https://github.com/KhronosGroup/SPIRV-Headers.git
+[submodule "src/3rdparty/spirv-tools"]
+	path = src/3rdparty/spirv-tools
+	url = https://github.com/KhronosGroup/SPIRV-Tools.git

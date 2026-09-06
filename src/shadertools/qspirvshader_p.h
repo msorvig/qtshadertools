@@ -96,6 +96,8 @@ public:
                               QShader::NativeShaderInfo *shaderInfo,
                               const MultiViewInfo &multiViewInfo,
                               const TessellationInfo &tessInfo) const;
+    QByteArray translateToWGSL(int version,
+                               QShader::NativeResourceBindingMap *nativeBindings) const;
     QString translationErrorMessage() const;
 
 private:

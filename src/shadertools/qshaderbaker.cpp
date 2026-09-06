@@ -596,6 +596,11 @@ QByteArray QShaderBakerPrivate::perTargetDefines(const QShaderBaker::GeneratedSh
         preamble += QByteArray::number(key.second.version());
         preamble += QByteArrayLiteral("\n");
         break;
+    case QShader::WgslShader:
+        preamble += QByteArrayLiteral("\n#define QSHADER_WGSL 1\n#define QSHADER_WGSL_VERSION ");
+        preamble += QByteArray::number(key.second.version());
+        preamble += QByteArrayLiteral("\n");
+        break;
     default:
         Q_UNREACHABLE();
     }
@@ -868,6 +873,25 @@ QShader QShaderBaker::bake()
                 shader.setEntryPoint(QByteArrayLiteral("main0"));
                 bs.setResourceBindingMap(key, nativeBindings);
                 bs.setNativeShaderInfo(key, shaderInfo);
+            }
+                break;
+            case QShader::WgslShader:
+            {
+                QShader::NativeResourceBindingMap nativeBindings;
+                shader.setShader(currentSpirvShader->translateToWGSL(req.second.version(),
+                                                                     &nativeBindings));
+                if (shader.shader().isEmpty()) {
+                    if (d->breakOnShaderTranslationError) {
+                        d->errorMessage = currentSpirvShader->translationErrorMessage();
+                        return QShader();
+                    } else {
+                        d->errorMessage += QLatin1String(" ") + currentSpirvShader->translationErrorMessage();
+                        continue;
+                    }
+                }
+                // WGSL entry points from Tint use the original name, typically "main"
+                shader.setEntryPoint(QByteArrayLiteral("main"));
+                bs.setResourceBindingMap(key, nativeBindings);
             }
                 break;
             default:
