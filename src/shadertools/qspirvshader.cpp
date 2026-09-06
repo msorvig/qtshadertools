@@ -9,6 +9,11 @@
 #include <private/qshader_p.h>
 
 #include <spirv_cross_c.h>
+#include <utility>
+
+#if __has_include(<tint/tint.h>)
+#include <tint/tint.h>
+#endif
 
 QT_BEGIN_NAMESPACE
 
@@ -1173,6 +1178,340 @@ QByteArray QSpirvShader::translateToMSL(int version,
     }
 
     return QByteArray(result);
+}
+
+// Splits combined image-sampler variables in SPIR-V into separate image and
+// sampler variables. WGSL (and Tint) do not support combined image-samplers,
+// so this transform is required before passing SPIR-V to Tint.
+//
+// For each combined image-sampler variable at binding B:
+//   - Creates a separate image variable (keeps binding B)
+//   - Creates a separate sampler variable (new binding)
+//   - Replaces OpLoad of the combined variable with OpLoad image + OpLoad sampler + OpSampledImage
+//
+// splitBindings maps original SPIR-V binding -> (texture binding, sampler binding)
+static QByteArray splitCombinedImageSamplersInSpirv(
+        const QByteArray &spirvInput,
+        QMap<int, std::pair<int, int>> *splitBindings)
+{
+    const uint32_t *data = reinterpret_cast<const uint32_t *>(spirvInput.constData());
+    const size_t totalWords = size_t(spirvInput.size()) / sizeof(uint32_t);
+
+    if (totalWords < 5 || data[0] != SpvMagicNumber)
+        return spirvInput;
+
+    // Parse all instructions into a mutable list
+    struct SpvInst {
+        QVector<uint32_t> words;
+        uint16_t op() const { return uint16_t(words[0] & 0xFFFF); }
+    };
+
+    QVector<SpvInst> insts;
+    for (size_t pos = 5; pos < totalWords; ) {
+        uint16_t len = uint16_t(data[pos] >> 16);
+        if (len == 0 || pos + len > totalWords)
+            break;
+        SpvInst inst;
+        inst.words.resize(len);
+        memcpy(inst.words.data(), data + pos, len * sizeof(uint32_t));
+        insts.append(std::move(inst));
+        pos += len;
+    }
+
+    uint32_t nextId = data[3]; // current bound
+
+    // Pass 1: Collect type information
+    QMap<uint32_t, uint32_t> sampledImageToImage; // OpTypeSampledImage result -> image type
+    QMap<uint32_t, std::pair<uint32_t, uint32_t>> pointers; // OpTypePointer result -> (storageClass, pointeeType)
+    QMap<uint32_t, uint32_t> varToType; // OpVariable result -> pointer type
+    QMap<uint32_t, int> idToBinding;
+    QMap<uint32_t, int> idToDescSet;
+    uint32_t existingTypeSamplerId = 0;
+    int maxBinding = -1;
+
+    for (const SpvInst &inst : insts) {
+        switch (inst.op()) {
+        case SpvOpTypeSampledImage:
+            sampledImageToImage[inst.words[1]] = inst.words[2];
+            break;
+        case SpvOpTypeSampler:
+            existingTypeSamplerId = inst.words[1];
+            break;
+        case SpvOpTypePointer:
+            pointers[inst.words[1]] = std::make_pair(inst.words[2], inst.words[3]);
+            break;
+        case SpvOpVariable:
+            varToType[inst.words[2]] = inst.words[1];
+            break;
+        case SpvOpDecorate:
+            if (inst.words[2] == SpvDecorationBinding) {
+                idToBinding[inst.words[1]] = int(inst.words[3]);
+                maxBinding = qMax(maxBinding, int(inst.words[3]));
+            } else if (inst.words[2] == SpvDecorationDescriptorSet) {
+                idToDescSet[inst.words[1]] = int(inst.words[3]);
+            }
+            break;
+        default:
+            break;
+        }
+    }
+
+    // Pass 2: Find combined image-sampler variables
+    struct SplitVar {
+        uint32_t origId;
+        uint32_t sampledImageTypeId;
+        uint32_t imageTypeId;
+        int binding;
+        int descSet;
+        uint32_t newImageId;
+        uint32_t newSamplerId;
+        uint32_t newPtrImageTypeId;
+        uint32_t newPtrSamplerTypeId;
+        int newSamplerBinding;
+    };
+
+    QVector<SplitVar> splits;
+    for (auto it = varToType.begin(); it != varToType.end(); ++it) {
+        uint32_t varId = it.key();
+        uint32_t ptrTypeId = it.value();
+        auto ptrIt = pointers.find(ptrTypeId);
+        if (ptrIt == pointers.end() || ptrIt->first != SpvStorageClassUniformConstant)
+            continue;
+        auto siIt = sampledImageToImage.find(ptrIt->second);
+        if (siIt == sampledImageToImage.end())
+            continue;
+
+        SplitVar sv = {};
+        sv.origId = varId;
+        sv.sampledImageTypeId = ptrIt->second;
+        sv.imageTypeId = siIt.value();
+        sv.binding = idToBinding.value(varId, -1);
+        sv.descSet = idToDescSet.value(varId, 0);
+        splits.append(sv);
+    }
+
+    if (splits.isEmpty())
+        return spirvInput;
+
+    // Allocate new IDs
+    uint32_t typeSamplerId = existingTypeSamplerId;
+    bool needNewTypeSampler = (typeSamplerId == 0);
+    if (needNewTypeSampler)
+        typeSamplerId = nextId++;
+
+    QMap<uint32_t, uint32_t> ptrImageTypeIds; // imageTypeId -> new OpTypePointer ID
+    uint32_t ptrSamplerTypeId = nextId++;
+
+    int nextSamplerBinding = maxBinding + 1;
+    for (SplitVar &sv : splits) {
+        if (!ptrImageTypeIds.contains(sv.imageTypeId))
+            ptrImageTypeIds[sv.imageTypeId] = nextId++;
+        sv.newPtrImageTypeId = ptrImageTypeIds[sv.imageTypeId];
+        sv.newPtrSamplerTypeId = ptrSamplerTypeId;
+        sv.newImageId = nextId++;
+        sv.newSamplerId = nextId++;
+        sv.newSamplerBinding = nextSamplerBinding++;
+    }
+
+    // Build lookup tables
+    QSet<uint32_t> splitVarIds;
+    QMap<uint32_t, const SplitVar *> splitVarMap;
+    for (const SplitVar &sv : splits) {
+        splitVarIds.insert(sv.origId);
+        splitVarMap[sv.origId] = &sv;
+    }
+
+    // Pass 3: Rebuild instruction stream
+    QVector<uint32_t> output;
+    output.reserve(int(totalWords) + splits.size() * 20);
+
+    // Copy header
+    for (int i = 0; i < 5; ++i)
+        output.append(data[i]);
+
+    // Helper to emit a SPIR-V instruction
+    auto emitInst = [&output](uint16_t opcode, std::initializer_list<uint32_t> operands) {
+        output.append((uint32_t(1 + operands.size()) << 16) | opcode);
+        for (uint32_t w : operands)
+            output.append(w);
+    };
+
+    auto emitRaw = [&output](const QVector<uint32_t> &words) {
+        output.append(words);
+    };
+
+    bool decorationsEmitted = false;
+    bool typesEmitted = false;
+
+    // Detect the start of the type/constant/variable section
+    auto isTypeConstOrVar = [](uint16_t op) {
+        return (op >= SpvOpTypeVoid && op <= SpvOpTypeForwardPointer) // all OpType*
+                || (op >= SpvOpConstantTrue && op <= SpvOpSpecConstantOp) // all OpConstant*/OpSpecConstant*
+                || op == SpvOpVariable
+                || op == SpvOpUndef;
+    };
+
+    for (int i = 0; i < insts.size(); ++i) {
+        const SpvInst &inst = insts[i];
+        uint16_t op = inst.op();
+
+        // Before the first type instruction, emit new decorations
+        if (!decorationsEmitted && isTypeConstOrVar(op)) {
+            for (const SplitVar &sv : splits) {
+                emitInst(SpvOpDecorate, { sv.newImageId, uint32_t(SpvDecorationBinding), uint32_t(sv.binding) });
+                emitInst(SpvOpDecorate, { sv.newImageId, uint32_t(SpvDecorationDescriptorSet), uint32_t(sv.descSet) });
+                emitInst(SpvOpDecorate, { sv.newSamplerId, uint32_t(SpvDecorationBinding), uint32_t(sv.newSamplerBinding) });
+                emitInst(SpvOpDecorate, { sv.newSamplerId, uint32_t(SpvDecorationDescriptorSet), uint32_t(sv.descSet) });
+            }
+            decorationsEmitted = true;
+        }
+
+        // Before OpFunction, emit new types and variables
+        if (!typesEmitted && op == SpvOpFunction) {
+            if (needNewTypeSampler)
+                emitInst(SpvOpTypeSampler, { typeSamplerId });
+            for (auto it = ptrImageTypeIds.begin(); it != ptrImageTypeIds.end(); ++it)
+                emitInst(SpvOpTypePointer, { it.value(), uint32_t(SpvStorageClassUniformConstant), it.key() });
+            emitInst(SpvOpTypePointer, { ptrSamplerTypeId, uint32_t(SpvStorageClassUniformConstant), typeSamplerId });
+            for (const SplitVar &sv : splits) {
+                emitInst(SpvOpVariable, { sv.newPtrImageTypeId, sv.newImageId, uint32_t(SpvStorageClassUniformConstant) });
+                emitInst(SpvOpVariable, { sv.newPtrSamplerTypeId, sv.newSamplerId, uint32_t(SpvStorageClassUniformConstant) });
+            }
+            typesEmitted = true;
+        }
+
+        // Skip decorations for split variables
+        if (op == SpvOpDecorate && splitVarIds.contains(inst.words[1])) {
+            uint32_t decoration = inst.words[2];
+            if (decoration == SpvDecorationBinding || decoration == SpvDecorationDescriptorSet)
+                continue; // handled above with new bindings
+            // Copy other decorations (e.g. RelaxedPrecision) to both new variables
+            const SplitVar *sv = splitVarMap[inst.words[1]];
+            QVector<uint32_t> copy = inst.words;
+            copy[1] = sv->newImageId;
+            emitRaw(copy);
+            copy[1] = sv->newSamplerId;
+            emitRaw(copy);
+            continue;
+        }
+
+        // Skip OpName for split variables (avoids dangling references)
+        if (op == SpvOpName && splitVarIds.contains(inst.words[1]))
+            continue;
+
+        // Skip old OpVariable for split variables
+        if (op == SpvOpVariable && splitVarIds.contains(inst.words[2]))
+            continue;
+
+        // Replace OpLoad of combined image-sampler with separate loads + OpSampledImage
+        if (op == SpvOpLoad && inst.words.size() >= 4) {
+            uint32_t pointerId = inst.words[3];
+            auto svIt = splitVarMap.find(pointerId);
+            if (svIt != splitVarMap.end()) {
+                const SplitVar *sv = *svIt;
+                uint32_t origResultId = inst.words[2];
+                uint32_t imgLoadId = nextId++;
+                uint32_t smpLoadId = nextId++;
+                emitInst(SpvOpLoad, { sv->imageTypeId, imgLoadId, sv->newImageId });
+                emitInst(SpvOpLoad, { typeSamplerId, smpLoadId, sv->newSamplerId });
+                // OpSampledImage reuses the original result ID so all downstream instructions work unchanged
+                emitInst(SpvOpSampledImage, { sv->sampledImageTypeId, origResultId, imgLoadId, smpLoadId });
+                continue;
+            }
+        }
+
+        // Emit instruction as-is
+        emitRaw(inst.words);
+    }
+
+    // Update bound in header
+    output[3] = nextId;
+
+    // Report split binding assignments
+    if (splitBindings) {
+        for (const SplitVar &sv : splits)
+            splitBindings->insert(sv.binding, std::make_pair(sv.binding, sv.newSamplerBinding));
+    }
+
+    return QByteArray(reinterpret_cast<const char *>(output.constData()),
+                      qsizetype(output.size()) * qsizetype(sizeof(uint32_t)));
+}
+
+QByteArray QSpirvShader::translateToWGSL(int version,
+                                         QShader::NativeResourceBindingMap *nativeBindings) const
+{
+    Q_UNUSED(version);
+    d->spirvCrossErrorMsg.clear();
+
+#if __has_include(<tint/tint.h>)
+    // Split combined image-samplers into separate image + sampler variables.
+    // WGSL does not support combined image-samplers, and Tint rejects them.
+    QMap<int, std::pair<int, int>> splitBindings;
+    QByteArray modifiedSpirv = splitCombinedImageSamplersInSpirv(d->ir, &splitBindings);
+
+    // Use Tint to convert the (potentially modified) SPIR-V to WGSL
+    const uint32_t *spirvData = reinterpret_cast<const uint32_t *>(modifiedSpirv.constData());
+    const size_t spirvWordCount = size_t(modifiedSpirv.size()) / sizeof(uint32_t);
+
+    tint::spirv::reader::Options spirvOptions;
+    spirvOptions.allow_non_uniform_derivatives = true;
+
+    auto program = tint::spirv::reader::Read(
+        std::vector<uint32_t>(spirvData, spirvData + spirvWordCount),
+        spirvOptions
+    );
+
+    if (!program.IsValid()) {
+        d->spirvCrossErrorMsg = QString::fromStdString(program.Diagnostics().Str());
+        return QByteArray();
+    }
+
+    // Generate WGSL output
+    tint::wgsl::writer::Options wgslOptions;
+    auto result = tint::wgsl::writer::Generate(program, wgslOptions);
+
+    if (result != tint::Success) {
+        d->spirvCrossErrorMsg = QString::fromStdString(result.Failure().reason.Str());
+        return QByteArray();
+    }
+
+    // Populate native binding map.
+    // For combined image-samplers that were split, use the split binding info
+    // (first = texture binding, second = sampler binding).
+    if (nativeBindings) {
+        for (const QShaderDescription::InOutVariable &var : d->shaderDescription.combinedImageSamplers()) {
+            auto it = splitBindings.find(var.binding);
+            if (it != splitBindings.end())
+                nativeBindings->insert(var.binding, { it->first, it->second });
+            else
+                nativeBindings->insert(var.binding, { var.binding, var.binding });
+        }
+
+        for (const QShaderDescription::InOutVariable &var : d->shaderDescription.separateImages())
+            nativeBindings->insert(var.binding, { var.binding, -1 });
+
+        for (const QShaderDescription::InOutVariable &var : d->shaderDescription.separateSamplers())
+            nativeBindings->insert(var.binding, { var.binding, -1 });
+
+        for (const QShaderDescription::UniformBlock &blk : d->shaderDescription.uniformBlocks())
+            nativeBindings->insert(blk.binding, { blk.binding, -1 });
+
+        for (const QShaderDescription::StorageBlock &blk : d->shaderDescription.storageBlocks())
+            nativeBindings->insert(blk.binding, { blk.binding, -1 });
+
+        for (const QShaderDescription::InOutVariable &var : d->shaderDescription.storageImages())
+            nativeBindings->insert(var.binding, { var.binding, -1 });
+    }
+
+    const std::string &wgsl = result->wgsl;
+    return QByteArray(wgsl.data(), qsizetype(wgsl.size()));
+
+#else
+    // Tint not available
+    d->spirvCrossErrorMsg = QLatin1String("WGSL translation requires Tint library which is not available");
+    Q_UNUSED(nativeBindings);
+    return QByteArray();
+#endif
 }
 
 QString QSpirvShader::translationErrorMessage() const
