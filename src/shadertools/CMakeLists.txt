@@ -7,6 +7,13 @@
 ## ShaderTools Module:
 #####################################################################
 
+set(_shadertools_optional_libraries "")
+set(_shadertools_has_tint 0)
+if(TARGET Qt::BundledTint)
+    list(APPEND _shadertools_optional_libraries Qt::BundledTint)
+    set(_shadertools_has_tint 1)
+endif()
+
 qt_internal_add_module(ShaderTools
     EXCEPTIONS
     SOURCES
@@ -19,9 +26,19 @@ qt_internal_add_module(ShaderTools
         qtshadertoolsglobal_p.h
     DEFINES
         QT_BUILD_SHADERTOOLS_LIB
+        TINT_BUILD_SPV_READER=1
+        TINT_BUILD_WGSL_WRITER=1
+        # The Tint headers are always on the include path, so __has_include
+        # cannot tell whether BundledTint is actually built (it is not with
+        # -no-feature-shadertools-tint, or without the 3rdparty sources).
+        QT_SHADERTOOLS_HAS_TINT=${_shadertools_has_tint}
     INCLUDE_DIRECTORIES
         ../3rdparty/SPIRV-Cross
         ../3rdparty/glslang
+        ../3rdparty/tint
+        ../3rdparty/tint/src
+        ../3rdparty/tint/include
+        ../3rdparty/spirv-tools/include
     LIBRARIES
         Qt::GuiPrivate
 # special case begin
@@ -29,6 +46,7 @@ qt_internal_add_module(ShaderTools
         Qt::BundledGlslang_Glslang
         Qt::BundledGlslang_Spirv
         Qt::BundledGlslang_Osdependent
+        ${_shadertools_optional_libraries}
 # special case end
     PUBLIC_LIBRARIES
         Qt::Core
